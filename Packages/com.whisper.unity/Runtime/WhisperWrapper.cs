@@ -17,7 +17,7 @@ namespace Whisper
     /// <summary>
     /// Wrapper for loaded whisper model.
     /// </summary>
-    public class WhisperWrapper
+    public class WhisperWrapper : IDisposable
     {
         public const int WhisperSampleRate = 16000;
 
@@ -34,9 +34,9 @@ namespace Whisper
         /// <remarks>Use <see cref="MainThreadDispatcher"/> for handling event in Unity main thread.</remarks>
         public event OnProgressDelegate OnProgress;
 
-        private readonly IntPtr _whisperCtx;
-        private readonly WhisperNativeParams _params;
+        private IntPtr _whisperCtx;
         private readonly object _lock = new object();
+        private bool _isDisposed;
 
         private WhisperWrapper(IntPtr whisperCtx)
         {
@@ -45,9 +45,13 @@ namespace Whisper
 
         ~WhisperWrapper()
         {
-            if (_whisperCtx == IntPtr.Zero)
-                return;
-            WhisperNative.whisper_free(_whisperCtx);
+            Dispose(false);
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
         }
 
         /// <summary>
@@ -61,6 +65,8 @@ namespace Whisper
         /// <returns>Full audio transcript. Null if transcription failed.</returns>
         public WhisperResult GetText(AudioClip clip, WhisperParams param)
         {
+            ThrowIfDisposed();
+
             // try to load data
             var samples = new float[clip.samples * clip.channels];
             if (!clip.GetData(samples, 0))
@@ -78,6 +84,8 @@ namespace Whisper
         /// <returns>Full audio transcript. Null if transcription failed.</returns>
         public async Task<WhisperResult> GetTextAsync(AudioClip clip, WhisperParams param)
         {
+            ThrowIfDisposed();
+
             var samples = new float[clip.samples * clip.channels];
             if (!clip.GetData(samples, 0))
             {
@@ -102,6 +110,8 @@ namespace Whisper
         /// <returns>Full audio transcript. Null if transcription failed.</returns>
         public WhisperResult GetText(float[] samples, int frequency, int channels, WhisperParams param)
         {
+            ThrowIfDisposed();
+
             lock (_lock)
             {
                 // preprocess data if necessary
@@ -132,11 +142,16 @@ namespace Whisper
                     nativeParams.progress_callback_user_data = GCHandle.ToIntPtr(gch);
                 }
 
-                // start inference
-                if (!InferenceWhisper(readySamples, nativeParams))
-                    return null;
-            
-                gch.Free();
+                try
+                {
+                    // start inference
+                    if (!InferenceWhisper(readySamples, nativeParams))
+                        return null;
+                }
+                finally
+                {
+                    gch.Free();
+                }
 
                 LogUtils.Verbose("Trying to get number of text segments...");
                 var n = WhisperNative.whisper_full_n_segments(_whisperCtx);
@@ -166,6 +181,8 @@ namespace Whisper
         /// <returns>Full audio transcript. Null if transcription failed.</returns>
         public async Task<WhisperResult> GetTextAsync(float[] samples, int frequency, int channels, WhisperParams param)
         {
+            ThrowIfDisposed();
+
             var asyncTask = Task.Factory.StartNew(() => GetText(samples, frequency, channels, param));
             return await asyncTask;
         }
@@ -271,14 +288,34 @@ namespace Whisper
         /// <returns>Loaded whisper model. Null if loading failed.</returns>
         public static WhisperWrapper InitFromFile(string modelPath, WhisperContextParams contextParams)
         {
-            // load model weights
             LogUtils.Log($"Trying to load Whisper model from {modelPath}...");
-            var buffer = FileUtils.ReadFile(modelPath);
-            if (buffer == null)
+
+            if (string.IsNullOrWhiteSpace(modelPath))
+            {
+                LogUtils.Error("Whisper model path is null or empty!");
                 return null;
-            
-            var res = InitFromBuffer(buffer, contextParams);
-            return res;
+            }
+
+            if (!File.Exists(modelPath))
+            {
+                LogUtils.Error($"Path {modelPath} doesn't exist!");
+                return null;
+            }
+
+            var sw = new Stopwatch();
+            sw.Start();
+
+            var ctx = WhisperNative.whisper_init_from_file_with_params(
+                modelPath,
+                contextParams.NativeParams);
+            if (ctx == IntPtr.Zero)
+            {
+                LogUtils.Error("Failed to load Whisper model from file!");
+                return null;
+            }
+
+            LogUtils.Log($"Whisper model is loaded, total time: {sw.ElapsedMilliseconds} ms.");
+            return new WhisperWrapper(ctx);
         }
 
         /// <summary>
@@ -300,13 +337,7 @@ namespace Whisper
         /// <returns>Loaded whisper model. Null if loading failed.</returns>
         public static async Task<WhisperWrapper> InitFromFileAsync(string modelPath, WhisperContextParams contextParams)
         {
-            LogUtils.Log($"Trying to load Whisper model from {modelPath}...");
-            var buffer = await FileUtils.ReadFileAsync(modelPath);
-            if (buffer == null)
-                return null;
-            
-            var res = await InitFromBufferAsync(buffer, contextParams);
-            return res;
+            return await Task.FromResult(InitFromFile(modelPath, contextParams));
         }
 
         /// <summary>
@@ -398,6 +429,83 @@ namespace Whisper
 
             var systemInfo = TextUtils.StringFromNativeUtf8(systemInfoPtr);
             return systemInfo;
+        }
+
+        /// <summary>
+        /// Get loaded native whisper.cpp version string.
+        /// </summary>
+        public static string GetVersion()
+        {
+            LogUtils.Verbose("Requesting Whisper version...");
+            var versionPtr = WhisperNative.whisper_version();
+            return TextUtils.StringFromNativeUtf8(versionPtr);
+        }
+
+        public static bool TryGetActiveBackend(out string backend)
+        {
+            try
+            {
+                var backendPtr = WhisperNative.whisper_unity_get_active_backend();
+                backend = backendPtr == IntPtr.Zero
+                    ? null
+                    : TextUtils.StringFromNativeUtf8(backendPtr);
+                return !string.IsNullOrWhiteSpace(backend);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                backend = null;
+                return false;
+            }
+            catch (DllNotFoundException)
+            {
+                backend = null;
+                return false;
+            }
+        }
+
+        public static bool TryGetLastBackendError(out string error)
+        {
+            try
+            {
+                var errorPtr = WhisperNative.whisper_unity_get_last_error();
+                error = errorPtr == IntPtr.Zero
+                    ? null
+                    : TextUtils.StringFromNativeUtf8(errorPtr);
+                return !string.IsNullOrWhiteSpace(error);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                error = null;
+                return false;
+            }
+            catch (DllNotFoundException)
+            {
+                error = null;
+                return false;
+            }
+        }
+
+        private void Dispose(bool disposing)
+        {
+            if (_isDisposed)
+                return;
+
+            lock (_lock)
+            {
+                if (_whisperCtx != IntPtr.Zero)
+                {
+                    WhisperNative.whisper_free(_whisperCtx);
+                    _whisperCtx = IntPtr.Zero;
+                }
+
+                _isDisposed = true;
+            }
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_isDisposed)
+                throw new ObjectDisposedException(nameof(WhisperWrapper));
         }
         
         private struct WhisperUserData

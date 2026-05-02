@@ -48,10 +48,18 @@ namespace Whisper
         public static WhisperContextParams GetDefaultParams()
         {
             LogUtils.Verbose($"Requesting default Whisper Context params...");
-            var nativeParams = WhisperNative.whisper_context_default_params();
-            LogUtils.Verbose("Default Whisper Context params generated!");
-
-            return new WhisperContextParams(nativeParams);
+            var nativeParamsPtr = WhisperNative.whisper_context_default_params_by_ref();
+            try
+            {
+                var nativeParams = Marshal.PtrToStructure<WhisperNativeContextParams>(nativeParamsPtr);
+                LogUtils.Verbose("Default Whisper Context params generated!");
+                return new WhisperContextParams(nativeParams);
+            }
+            finally
+            {
+                if (nativeParamsPtr != IntPtr.Zero)
+                    WhisperNative.whisper_free_context_params(nativeParamsPtr);
+            }
         }
     }
 
@@ -66,6 +74,8 @@ namespace Whisper
          private IntPtr _languagePtr = IntPtr.Zero;
          private string _initialPromptManaged;
          private IntPtr _initialPromptPtr = IntPtr.Zero;
+         private string _vadModelPathManaged;
+         private IntPtr _vadModelPathPtr = IntPtr.Zero;
          
          /// <summary>
          /// Native C++ struct parameters.
@@ -84,6 +94,10 @@ namespace Whisper
              // copy initial_prompt string to managed memory
              var initialPromptStrPtr = new IntPtr(param.initial_prompt);
              _initialPromptManaged = Marshal.PtrToStringAnsi(initialPromptStrPtr);
+
+             // copy VAD model path string to managed memory
+             var vadModelPathStrPtr = new IntPtr(param.vad_model_path);
+             _vadModelPathManaged = Marshal.PtrToStringAnsi(vadModelPathStrPtr);
              
              // reset callbacks
              _param.new_segment_callback = null;
@@ -96,6 +110,7 @@ namespace Whisper
          {
              FreeLanguageString();
              FreeInitialPromptString();
+             FreeVadModelPathString();
          }
 
          #region Basic Parameters
@@ -247,6 +262,8 @@ namespace Whisper
                  {
                      // free previous string
                      FreeLanguageString();
+
+                     _param.language = null;
                      
                      // copies string in unmanaged memory to avoid GC
                      if (_languageManaged == null) return;
@@ -273,6 +290,8 @@ namespace Whisper
                  {
                      // free previous string
                      FreeInitialPromptString();
+
+                     _param.initial_prompt = null;
                      
                      // copies string in unmanaged memory to avoid GC
                      if (_initialPromptManaged == null) return;
@@ -280,6 +299,15 @@ namespace Whisper
                      _param.initial_prompt = (byte*)_initialPromptPtr;
                  }
              }
+         }
+
+         /// <summary>
+         /// If true, always prepend initial prompt to every decode window.
+         /// </summary>
+         public bool CarryInitialPrompt
+         {
+             get => _param.carry_initial_prompt;
+             set => _param.carry_initial_prompt = value;
          }
          
          #endregion
@@ -307,6 +335,42 @@ namespace Whisper
          {
              get => _param.audio_ctx;
              set => _param.audio_ctx = value;
+         }
+
+         /// <summary>
+         /// Enable whisper.cpp voice activity detection in batch transcription.
+         /// </summary>
+         public bool VadEnabled
+         {
+             get => _param.vad;
+             set => _param.vad = value;
+         }
+
+         /// <summary>
+         /// Optional path to an external VAD model file.
+         /// </summary>
+         public string VadModelPath
+         {
+             get => _vadModelPathManaged;
+             set
+             {
+                 if (_vadModelPathManaged == value)
+                     return;
+
+                 _vadModelPathManaged = value;
+                 unsafe
+                 {
+                     FreeVadModelPathString();
+
+                     _param.vad_model_path = null;
+
+                     if (_vadModelPathManaged == null)
+                         return;
+
+                     _vadModelPathPtr = Marshal.StringToHGlobalAnsi(_vadModelPathManaged);
+                     _param.vad_model_path = (byte*)_vadModelPathPtr;
+                 }
+             }
          }
 
          #endregion
@@ -353,8 +417,8 @@ namespace Whisper
          /// </summary>
          public IntPtr ProgressCallbackUserData
          {
-             get => _param.new_segment_callback_user_data;
-             set => _param.new_segment_callback_user_data = value;
+             get => _param.progress_callback_user_data;
+             set => _param.progress_callback_user_data = value;
          }
 
          #endregion
@@ -387,23 +451,41 @@ namespace Whisper
                  Marshal.FreeHGlobal(_initialPromptPtr);
              _initialPromptPtr = IntPtr.Zero;
          }
+
+         private void FreeVadModelPathString()
+         {
+             // if C# allocated new string before - clear it
+             // but only clear C# string, not C++ literals
+             if (_vadModelPathPtr != IntPtr.Zero)
+                 Marshal.FreeHGlobal(_vadModelPathPtr);
+             _vadModelPathPtr = IntPtr.Zero;
+         }
          
          public static WhisperParams GetDefaultParams(WhisperSamplingStrategy strategy =
              WhisperSamplingStrategy.WHISPER_SAMPLING_GREEDY)
          {
              LogUtils.Verbose($"Requesting default Whisper params for strategy {strategy}...");
-             var nativeParams = WhisperNative.whisper_full_default_params(strategy);
-             LogUtils.Verbose("Default params generated!");
-
-             var param = new WhisperParams(nativeParams)
+             var nativeParamsPtr = WhisperNative.whisper_full_default_params_by_ref(strategy);
+             try
              {
-                 // usually don't need C++ output log in Unity
-                 PrintProgress = false,
-                 PrintRealtime = false,
-                 PrintTimestamps = false
-             };
+                 var nativeParams = Marshal.PtrToStructure<WhisperNativeParams>(nativeParamsPtr);
+                 LogUtils.Verbose("Default params generated!");
 
-             return param;
+                 var param = new WhisperParams(nativeParams)
+                 {
+                     // usually don't need C++ output log in Unity
+                     PrintProgress = false,
+                     PrintRealtime = false,
+                     PrintTimestamps = false
+                 };
+
+                 return param;
+             }
+             finally
+             {
+                 if (nativeParamsPtr != IntPtr.Zero)
+                     WhisperNative.whisper_free_params(nativeParamsPtr);
+             }
          }
      }   
 }

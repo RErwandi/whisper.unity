@@ -64,13 +64,13 @@ namespace Whisper.Native
 
         // token-level timestamp data
         // do not use if you haven't computed token-level timestamps
-        public ulong t0;        // start time of the token
-        public ulong t1;        //   end time of the token
+        public long t0;        // start time of the token
+        public long t1;        //   end time of the token
 
         // [EXPERIMENTAL] Token-level timestamps with DTW
         // do not use if you haven't computed token-level timestamps with dtw
         // Roughly corresponds to the moment in audio in which the token was output
-        ulong t_dtw;
+        long t_dtw;
 
         public float vlen;        // voice length of the token
     }
@@ -80,6 +80,17 @@ namespace Whisper.Native
     {
         UIntPtr n_heads;
         IntPtr heads;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WhisperNativeVadParams
+    {
+        public float threshold;
+        public int min_speech_duration_ms;
+        public int min_silence_duration_ms;
+        public float max_speech_duration_s;
+        public int speech_pad_ms;
+        public float samples_overlap;
     }
 
     /// <summary>
@@ -152,6 +163,7 @@ namespace Whisper.Native
         // use whisper_tokenize() to convert text to tokens
         // maximum of whisper_n_text_ctx()/2 tokens are used (typically 224)
         public byte* initial_prompt;
+        [MarshalAs(UnmanagedType.U1)] public bool carry_initial_prompt;
         whisper_token_ptr prompt_tokens;
         int prompt_n_tokens;
 
@@ -215,5 +227,9 @@ namespace Whisper.Native
         UIntPtr n_grammar_rules;
         UIntPtr i_start_rule;
         float grammar_penalty;
+
+        [MarshalAs(UnmanagedType.U1)] public bool vad;
+        public byte* vad_model_path;
+        public WhisperNativeVadParams vad_params;
     }
 }

@@ -19,8 +19,22 @@ namespace Whisper.Native
 #endif
         
         [DllImport(LibraryName)]
+        public static extern whisper_context_ptr whisper_init_from_file_with_params(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path_model,
+            WhisperNativeContextParams @params);
+
+        [DllImport(LibraryName)]
         public static extern whisper_context_ptr whisper_init_from_buffer_with_params(IntPtr buffer,
             UIntPtr buffer_size, WhisperNativeContextParams @params);
+
+        [DllImport(LibraryName)]
+        public static extern IntPtr whisper_version();
+
+        [DllImport(LibraryName)]
+        public static extern IntPtr whisper_unity_get_active_backend();
+
+        [DllImport(LibraryName)]
+        public static extern IntPtr whisper_unity_get_last_error();
 
         [DllImport(LibraryName)]
         public static extern int whisper_lang_max_id();
@@ -42,6 +56,18 @@ namespace Whisper.Native
 
         [DllImport(LibraryName)]
         public static extern WhisperNativeContextParams whisper_context_default_params();
+
+        [DllImport(LibraryName)]
+        public static extern IntPtr whisper_full_default_params_by_ref(WhisperSamplingStrategy strategy);
+
+        [DllImport(LibraryName)]
+        public static extern IntPtr whisper_context_default_params_by_ref();
+
+        [DllImport(LibraryName)]
+        public static extern void whisper_free_params(IntPtr @params);
+
+        [DllImport(LibraryName)]
+        public static extern void whisper_free_context_params(IntPtr @params);
 
         [DllImport(LibraryName)]
         public static extern int whisper_full(whisper_context_ptr ctx, WhisperNativeParams param,

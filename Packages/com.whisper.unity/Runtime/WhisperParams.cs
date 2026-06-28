@@ -43,6 +43,20 @@ namespace Whisper
         }
 
         /// <summary>
+        /// GPU device index used by native whisper.cpp backends.
+        /// </summary>
+        public int GpuDevice
+        {
+            get => _param.gpu_device;
+            set
+            {
+                if (value < 0)
+                    throw new ArgumentException("GPU device index should be bigger or equal zero.");
+                _param.gpu_device = value;
+            }
+        }
+
+        /// <summary>
         /// Create a new default Whisper Context parameters.
         /// </summary>
         public static WhisperContextParams GetDefaultParams()

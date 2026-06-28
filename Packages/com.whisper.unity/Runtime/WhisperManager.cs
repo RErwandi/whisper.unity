@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
 using UnityEngine;
-using UnityEngine.Serialization;
+using UnityEngine.Localization;
+using UnityEngine.Localization.Settings;
 using Whisper.Native;
 using Whisper.Utils;
 
@@ -20,10 +22,26 @@ namespace Whisper
         [SerializeField] 
         [Tooltip("Path to model weights file")]
         private string modelPath = "Whisper/ggml-tiny.bin";
+
+        [SerializeField]
+        [Tooltip("Optional English-specific model weights file used when the current language is English")]
+        private string englishModelPath;
+
+        [SerializeField]
+        [Tooltip("Optional list of player-selectable Whisper models")]
+        private List<WhisperModelDefinition> availableModels = new List<WhisperModelDefinition>();
+
+        [SerializeField]
+        [Tooltip("Model index used by InitModel when availableModels is populated")]
+        private int defaultModelIndex;
         
         [SerializeField]
         [Tooltip("Determines whether the StreamingAssets folder should be prepended to the model path")]
         private bool isModelPathInStreamingAssets = true;
+
+        [SerializeField]
+        [Tooltip("Determines whether the StreamingAssets folder should be prepended to the English model path")]
+        private bool isEnglishModelPathInStreamingAssets = true;
         
         [SerializeField] 
         [Tooltip("Should model weights be loaded on awake?")]
@@ -33,6 +51,14 @@ namespace Whisper
         [Tooltip("Try to load whisper in GPU for faster inference")]
         [SerializeField]
         private bool useGpu;
+
+        [Tooltip("GPU device index used by native whisper.cpp backends")]
+        [SerializeField]
+        private int gpuDevice;
+
+        [Tooltip("Allow WHISPER_ARG_DEVICE or GPU_DEVICE environment variable to override GPU Device")]
+        [SerializeField]
+        private bool gpuDeviceEnvOverride = true;
         
         [Tooltip("Use the Flash Attention algorithm for faster inference")]
         [SerializeField]
@@ -104,6 +130,10 @@ namespace Whisper
         private WhisperWrapper _whisper;
         private WhisperParams _params;
         private readonly MainThreadDispatcher _dispatcher = new MainThreadDispatcher();
+        private int _activeModelIndex;
+        private string _loadedModelPath;
+        private bool _isLoadedModelPathInStreamingAssets;
+        private const string SpeechModelPrefsKey = "speech_model";
 
         public string ModelPath
         {
@@ -118,6 +148,15 @@ namespace Whisper
                 modelPath = value;
             }
         }
+
+        public IReadOnlyList<WhisperModelDefinition> AvailableModels => availableModels;
+        public int ActiveModelIndex => _activeModelIndex;
+        public string ActiveBackend => WhisperWrapper.TryGetActiveBackend(out var backend) ? backend : null;
+        public string LastBackendError => WhisperWrapper.TryGetLastBackendError(out var error) ? error : null;
+        public bool UseGpu => useGpu;
+        public int GpuDevice => gpuDevice;
+        public bool GpuDeviceEnvOverride => gpuDeviceEnvOverride;
+        public bool FlashAttention => flashAttention;
         
         public bool IsModelPathInStreamingAssets
         {
@@ -146,15 +185,61 @@ namespace Whisper
         private async void Awake()
         {
             LogUtils.Level = logLevel;
+            OnLocaleChanged(LocalizationSettings.SelectedLocale);
+            LocalizationSettings.SelectedLocaleChanged += OnLocaleChanged;
             
             if (!initOnAwake)
                 return;
             await InitModel();
         }
 
+        private void OnDestroy()
+        {
+            LocalizationSettings.SelectedLocaleChanged -= OnLocaleChanged;
+            UnloadModel();
+        }
+
+        private async void OnLocaleChanged(Locale locale)
+        {
+            language = GetWhisperLangCode(locale);
+            await ReloadModelForLocaleIfNeeded();
+        }
+        
+        private string GetWhisperLangCode(Locale locale)
+        {
+            if (locale == null)
+                return "en"; // fallback to English
+
+            var code = locale.Identifier.Code;
+
+            // Whisper expects ISO 639-1 language code (2 letters)
+            // If regional variant exists, just take first 2 letters
+            if (code.Contains("-"))
+            {
+                var parts = code.Split('-');
+                return parts[0]; 
+            }
+
+            return code;
+        }
+        
+
         private void OnValidate()
         {
             LogUtils.Level = logLevel;
+
+            if (defaultModelIndex < 0)
+                defaultModelIndex = 0;
+
+            if (gpuDevice < 0)
+                gpuDevice = 0;
+
+            if (availableModels.Count > 0)
+            {
+                var maxIndex = availableModels.Count - 1;
+                if (defaultModelIndex > maxIndex)
+                    defaultModelIndex = maxIndex;
+            }
         }
 
         private void Update()
@@ -167,41 +252,168 @@ namespace Whisper
         /// </summary>
         public async Task InitModel()
         {
-            // check if model is already loaded or actively loading
-            if (IsLoaded)
+            if (availableModels.Count > 0)
             {
-                LogUtils.Warning("Whisper model is already loaded and ready for use!");
+                var startupModelIndex = GetStartupModelIndex();
+                await LoadModelAsync(startupModelIndex);
                 return;
             }
 
+            var resolvedModel = ResolveModelTarget(
+                modelPath,
+                isModelPathInStreamingAssets,
+                englishModelPath,
+                isEnglishModelPathInStreamingAssets);
+            await LoadModelAsync(
+                resolvedModel.ModelPath,
+                resolvedModel.IsPathInStreamingAssets);
+        }
+
+        /// <summary>
+        /// Load one of the configured Whisper models by index.
+        /// </summary>
+        public async Task<bool> LoadModelAsync(int modelIndex)
+        {
+            if (!TryGetModelDefinition(modelIndex, out var model))
+            {
+                LogUtils.Error($"Whisper model index {modelIndex} is invalid.");
+                return false;
+            }
+
+            var resolvedModel = ResolveModelTarget(model);
+            if (IsLoaded &&
+                _activeModelIndex == modelIndex &&
+                IsResolvedModelLoaded(resolvedModel))
+            {
+                return true;
+            }
+
+            var loaded = await LoadModelAsync(
+                resolvedModel.ModelPath,
+                resolvedModel.IsPathInStreamingAssets);
+            if (loaded)
+            {
+                _activeModelIndex = modelIndex;
+            }
+
+            return loaded;
+        }
+
+        /// <summary>
+        /// Load Whisper model from explicit path and unload current model if necessary.
+        /// </summary>
+        public async Task<bool> LoadModelAsync(string targetModelPath, bool isPathInStreamingAssets)
+        {
+            // check if model is already loaded or actively loading
             if (IsLoading)
             {
                 LogUtils.Warning("Whisper model is already loading!");
-                return;
+                return false;
             }
 
-            // load model and default params
+            if (string.IsNullOrWhiteSpace(targetModelPath))
+            {
+                LogUtils.Error("Whisper model path is empty!");
+                return false;
+            }
+
+            if (IsLoaded &&
+                string.Equals(_loadedModelPath, targetModelPath, StringComparison.Ordinal) &&
+                _isLoadedModelPathInStreamingAssets == isPathInStreamingAssets)
+            {
+                return true;
+            }
+
             IsLoading = true;
             try
             {
-                var path = isModelPathInStreamingAssets
-                    ? Path.Combine(Application.streamingAssetsPath, modelPath)
-                    : modelPath;
+                UnloadModel();
+
+                var path = isPathInStreamingAssets
+                    ? Path.Combine(Application.streamingAssetsPath, targetModelPath)
+                    : targetModelPath;
 
                 var context = CreateContextParams();
                 _whisper = await WhisperWrapper.InitFromFileAsync(path, context);
+                if (_whisper == null)
+                {
+                    LogUtils.Error($"Failed to initialize Whisper model from {path}.");
+                    return false;
+                }
+
                 _params = WhisperParams.GetDefaultParams(strategy);
                 UpdateParams();
                 
                 _whisper.OnNewSegment += OnNewSegmentHandler;
                 _whisper.OnProgress += OnProgressHandler;
+                _loadedModelPath = targetModelPath;
+                _isLoadedModelPathInStreamingAssets = isPathInStreamingAssets;
+                LogBackendSelection(path, context);
+                Debug.Log($"[Whisper] Initialized model: {path}");
+                return true;
             }
             catch (Exception e)
             {
                 LogUtils.Exception(e);
+                return false;
+            }
+            finally
+            {
+                IsLoading = false;
+            }
+        }
+
+        /// <summary>
+        /// Switch currently active model to one of the configured options.
+        /// </summary>
+        public async Task<bool> SwitchModelAsync(int modelIndex)
+        {
+            return await LoadModelAsync(modelIndex);
+        }
+
+        public bool SetGpuOptions(bool enableGpu, bool enableFlashAttention)
+        {
+            return SetGpuOptions(enableGpu, enableFlashAttention, gpuDevice, gpuDeviceEnvOverride);
+        }
+
+        public bool SetGpuOptions(bool enableGpu, bool enableFlashAttention, int gpuDeviceIndex,
+            bool allowEnvironmentOverride = true)
+        {
+            if (IsLoading)
+            {
+                LogUtils.Warning("Cannot change Whisper GPU options while model is loading.");
+                return false;
             }
 
-            IsLoading = false;
+            if (gpuDeviceIndex < 0)
+            {
+                LogUtils.Warning("Cannot set Whisper GPU device to a negative index.");
+                return false;
+            }
+
+            useGpu = enableGpu;
+            flashAttention = enableFlashAttention;
+            gpuDevice = gpuDeviceIndex;
+            gpuDeviceEnvOverride = allowEnvironmentOverride;
+            return true;
+        }
+
+        /// <summary>
+        /// Release currently loaded model from memory.
+        /// </summary>
+        public void UnloadModel()
+        {
+            if (_whisper == null)
+                return;
+
+            _whisper.OnNewSegment -= OnNewSegmentHandler;
+            _whisper.OnProgress -= OnProgressHandler;
+            _whisper.Dispose();
+            _whisper = null;
+            _params = null;
+            _activeModelIndex = -1;
+            _loadedModelPath = null;
+            _isLoadedModelPathInStreamingAssets = false;
         }
         
         /// <summary>
@@ -224,6 +436,7 @@ namespace Whisper
         /// <returns>Full audio transcript. Null if transcription failed.</returns>
         public async Task<WhisperResult> GetTextAsync(AudioClip clip)
         {
+            await EnsureDefaultModelLoaded();
             var isLoaded = await CheckIfLoaded();
             if (!isLoaded)
                 return null;
@@ -242,6 +455,7 @@ namespace Whisper
         /// <returns>Full audio transcript. Null if transcription failed.</returns>
         public async Task<WhisperResult> GetTextAsync(float[] samples, int frequency, int channels)
         {
+            await EnsureDefaultModelLoaded();
             var isLoaded = await CheckIfLoaded();
             if (!isLoaded)
                 return null;
@@ -259,6 +473,7 @@ namespace Whisper
         /// <returns>New streaming transcription. Null if failed.</returns>
         public async Task<WhisperStream> CreateStream(int frequency, int channels)
         {
+            await EnsureDefaultModelLoaded();
             var isLoaded = await CheckIfLoaded();
             if (!isLoaded)
             {
@@ -279,6 +494,7 @@ namespace Whisper
         /// <returns>New streaming transcription. Null if failed.</returns>
         public async Task<WhisperStream> CreateStream(MicrophoneRecord microphone)
         {
+            await EnsureDefaultModelLoaded();
             var isLoaded = await CheckIfLoaded();
             if (!isLoaded)
             {
@@ -313,7 +529,73 @@ namespace Whisper
             var context = WhisperContextParams.GetDefaultParams();
             context.UseGpu = useGpu;
             context.FlashAttn = flashAttention;
+            context.GpuDevice = ResolveGpuDevice(useGpu, gpuDevice, gpuDeviceEnvOverride);
             return context;
+        }
+
+        public static int ResolveGpuDevice(bool useGpu, int configuredGpuDevice, bool useEnvironmentOverride = true)
+        {
+            if (!useGpu)
+                return 0;
+
+            if (configuredGpuDevice < 0)
+            {
+                LogUtils.Warning($"Configured GPU device {configuredGpuDevice} is invalid. Falling back to device 0.");
+                configuredGpuDevice = 0;
+            }
+
+            if (!useEnvironmentOverride)
+                return configuredGpuDevice;
+
+            if (TryGetGpuDeviceFromEnvironment("WHISPER_ARG_DEVICE", out var whisperArgDevice))
+                return whisperArgDevice;
+
+            if (TryGetGpuDeviceFromEnvironment("GPU_DEVICE", out var gpuDeviceEnv))
+                return gpuDeviceEnv;
+
+            return configuredGpuDevice;
+        }
+
+        private static bool TryGetGpuDeviceFromEnvironment(string variableName, out int device)
+        {
+            device = 0;
+            var value = Environment.GetEnvironmentVariable(variableName);
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            if (int.TryParse(value, out device) && device >= 0)
+                return true;
+
+            LogUtils.Warning($"Ignoring invalid {variableName} value '{value}'. GPU device should be a non-negative integer.");
+            device = 0;
+            return false;
+        }
+
+        private static string GetEnvironmentValueForLog(string variableName)
+        {
+            var value = Environment.GetEnvironmentVariable(variableName);
+            return string.IsNullOrWhiteSpace(value) ? "<not set>" : value;
+        }
+
+        private void LogBackendSelection(string path, WhisperContextParams context)
+        {
+            LogUtils.Log($"Whisper GPU request: useGpu={context.UseGpu}, gpuDevice={context.GpuDevice}, " +
+                         $"WHISPER_ARG_DEVICE={GetEnvironmentValueForLog("WHISPER_ARG_DEVICE")}, " +
+                         $"GPU_DEVICE={GetEnvironmentValueForLog("GPU_DEVICE")}");
+
+            if (!WhisperWrapper.TryGetActiveBackend(out var backend))
+                return;
+
+            if (string.Equals(backend, "cpu", StringComparison.OrdinalIgnoreCase) &&
+                useGpu &&
+                WhisperWrapper.TryGetLastBackendError(out var error))
+            {
+                LogUtils.Warning(
+                    $"Whisper GPU initialization failed for model '{path}'. Falling back to CPU backend. Reason: {error}");
+                return;
+            }
+
+            LogUtils.Log($"Whisper backend selected: {backend}");
         }
 
         private async Task<bool> CheckIfLoaded()
@@ -332,6 +614,104 @@ namespace Whisper
 
             return IsLoaded;
         }
+
+        private bool TryGetModelDefinition(int modelIndex, out WhisperModelDefinition model)
+        {
+            if (modelIndex >= 0 && modelIndex < availableModels.Count)
+            {
+                model = availableModels[modelIndex];
+                return model != null;
+            }
+
+            model = null;
+            return false;
+        }
+
+        private async Task EnsureDefaultModelLoaded()
+        {
+            if (IsLoaded)
+                return;
+
+            await InitModel();
+        }
+
+        private int GetStartupModelIndex()
+        {
+            var savedModelIndex = PlayerPrefs.GetInt(SpeechModelPrefsKey, defaultModelIndex);
+            return Mathf.Clamp(savedModelIndex, 0, availableModels.Count - 1);
+        }
+
+        private async Task ReloadModelForLocaleIfNeeded()
+        {
+            if (!IsLoaded && !IsLoading)
+                return;
+
+            while (IsLoading)
+            {
+                await Task.Yield();
+            }
+
+            if (!IsLoaded)
+                return;
+
+            if (availableModels.Count > 0)
+            {
+                if (!TryGetModelDefinition(_activeModelIndex, out var model))
+                    return;
+
+                var resolvedModel = ResolveModelTarget(model);
+                if (IsResolvedModelLoaded(resolvedModel))
+                    return;
+
+                await LoadModelAsync(_activeModelIndex);
+                return;
+            }
+
+            var resolvedSingleModel = ResolveModelTarget(
+                modelPath,
+                isModelPathInStreamingAssets,
+                englishModelPath,
+                isEnglishModelPathInStreamingAssets);
+            if (IsResolvedModelLoaded(resolvedSingleModel))
+                return;
+
+            await LoadModelAsync(
+                resolvedSingleModel.ModelPath,
+                resolvedSingleModel.IsPathInStreamingAssets);
+        }
+
+        private bool IsResolvedModelLoaded(ResolvedModelTarget resolvedModel)
+        {
+            return string.Equals(_loadedModelPath, resolvedModel.ModelPath, StringComparison.Ordinal) &&
+                   _isLoadedModelPathInStreamingAssets == resolvedModel.IsPathInStreamingAssets;
+        }
+
+        private ResolvedModelTarget ResolveModelTarget(WhisperModelDefinition model)
+        {
+            return ResolveModelTarget(
+                model.ModelPath,
+                model.IsPathInStreamingAssets,
+                model.EnglishModelPath,
+                model.IsEnglishPathInStreamingAssets);
+        }
+
+        private ResolvedModelTarget ResolveModelTarget(
+            string defaultModelPath,
+            bool isDefaultModelPathInStreamingAssets,
+            string englishOverrideModelPath,
+            bool isEnglishOverrideModelPathInStreamingAssets)
+        {
+            var useEnglishModel = string.Equals(language, "en", StringComparison.Ordinal) &&
+                                  !string.IsNullOrWhiteSpace(englishOverrideModelPath);
+            if (useEnglishModel)
+            {
+                return new ResolvedModelTarget(
+                    englishOverrideModelPath,
+                    isEnglishOverrideModelPathInStreamingAssets);
+            }
+
+            return new ResolvedModelTarget(defaultModelPath, isDefaultModelPathInStreamingAssets);
+        }
         
         private void OnNewSegmentHandler(WhisperSegment segment)
         {
@@ -347,6 +727,18 @@ namespace Whisper
             {
                 OnProgress?.Invoke(progress);
             });
+        }
+
+        private readonly struct ResolvedModelTarget
+        {
+            public readonly string ModelPath;
+            public readonly bool IsPathInStreamingAssets;
+
+            public ResolvedModelTarget(string modelPath, bool isPathInStreamingAssets)
+            {
+                ModelPath = modelPath;
+                IsPathInStreamingAssets = isPathInStreamingAssets;
+            }
         }
     }
 }

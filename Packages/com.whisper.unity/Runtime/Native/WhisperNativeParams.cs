@@ -103,7 +103,7 @@ namespace Whisper.Native
     {
         [MarshalAs(UnmanagedType.U1)] public bool use_gpu;
         [MarshalAs(UnmanagedType.U1)] public bool flash_attn;
-        int gpu_device;  // CUDA device
+        public int gpu_device;  // GPU device
 
         // [EXPERIMENTAL] Token-level timestamps with DTW
         [MarshalAs(UnmanagedType.U1)] bool dtw_token_timestamps;

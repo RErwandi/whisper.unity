@@ -1,3 +1,4 @@
+using System;
 using NUnit.Framework;
 using Whisper.Native;
 
@@ -55,6 +56,80 @@ namespace Whisper.Tests
             const string constPrompt = "hello how is it going always use lowercase no punctuation goodbye one two three start stop i you me they";
             param.InitialPrompt = constPrompt;
             Assert.AreEqual(constPrompt, param.InitialPrompt);
+        }
+
+        [Test]
+        public void ContextGpuDeviceParamsTest()
+        {
+            var param = WhisperContextParams.GetDefaultParams();
+            Assert.NotNull(param);
+
+            Assert.AreEqual(0, param.GpuDevice);
+            param.GpuDevice = 1;
+            Assert.AreEqual(1, param.GpuDevice);
+            Assert.Throws<ArgumentException>(() => param.GpuDevice = -1);
+        }
+
+        [Test]
+        public void ResolveGpuDeviceUsesConfiguredValueWithoutEnvironment()
+        {
+            WithGpuDeviceEnvironment(null, null, () =>
+            {
+                Assert.AreEqual(2, WhisperManager.ResolveGpuDevice(true, 2));
+            });
+        }
+
+        [Test]
+        public void ResolveGpuDeviceReturnsZeroWhenGpuDisabled()
+        {
+            WithGpuDeviceEnvironment("3", "2", () =>
+            {
+                Assert.AreEqual(0, WhisperManager.ResolveGpuDevice(false, 1));
+            });
+        }
+
+        [Test]
+        public void ResolveGpuDeviceUsesWhisperArgDeviceEnvironment()
+        {
+            WithGpuDeviceEnvironment("1", null, () =>
+            {
+                Assert.AreEqual(1, WhisperManager.ResolveGpuDevice(true, 0));
+            });
+        }
+
+        [Test]
+        public void ResolveGpuDeviceUsesGpuDeviceEnvironment()
+        {
+            WithGpuDeviceEnvironment(null, "3", () =>
+            {
+                Assert.AreEqual(3, WhisperManager.ResolveGpuDevice(true, 0));
+            });
+        }
+
+        [Test]
+        public void ResolveGpuDeviceFallsBackOnInvalidEnvironment()
+        {
+            WithGpuDeviceEnvironment("invalid", "-1", () =>
+            {
+                Assert.AreEqual(2, WhisperManager.ResolveGpuDevice(true, 2));
+            });
+        }
+
+        private static void WithGpuDeviceEnvironment(string whisperArgDevice, string gpuDevice, Action action)
+        {
+            var oldWhisperArgDevice = Environment.GetEnvironmentVariable("WHISPER_ARG_DEVICE");
+            var oldGpuDevice = Environment.GetEnvironmentVariable("GPU_DEVICE");
+            try
+            {
+                Environment.SetEnvironmentVariable("WHISPER_ARG_DEVICE", whisperArgDevice);
+                Environment.SetEnvironmentVariable("GPU_DEVICE", gpuDevice);
+                action();
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("WHISPER_ARG_DEVICE", oldWhisperArgDevice);
+                Environment.SetEnvironmentVariable("GPU_DEVICE", oldGpuDevice);
+            }
         }
     }
 }

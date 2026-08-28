@@ -95,7 +95,7 @@ namespace Whisper
 
             var frequency = clip.frequency;
             var channels = clip.channels;
-            var asyncTask = Task.Factory.StartNew(() => GetText(samples, frequency, channels, param));
+            var asyncTask = Task.Run(() => GetText(samples, frequency, channels, param));
             return await asyncTask;
             
         }
@@ -183,7 +183,7 @@ namespace Whisper
         {
             ThrowIfDisposed();
 
-            var asyncTask = Task.Factory.StartNew(() => GetText(samples, frequency, channels, param));
+            var asyncTask = Task.Run(() => GetText(samples, frequency, channels, param));
             return await asyncTask;
         }
 
@@ -337,7 +337,8 @@ namespace Whisper
         /// <returns>Loaded whisper model. Null if loading failed.</returns>
         public static async Task<WhisperWrapper> InitFromFileAsync(string modelPath, WhisperContextParams contextParams)
         {
-            return await Task.FromResult(InitFromFile(modelPath, contextParams));
+            var asyncTask = Task.Run(() => InitFromFile(modelPath, contextParams));
+            return await asyncTask;
         }
 
         /// <summary>
@@ -408,7 +409,7 @@ namespace Whisper
         /// <returns>Loaded whisper model. Null if loading failed.</returns>
         public static async Task<WhisperWrapper> InitFromBufferAsync(byte[] buffer, WhisperContextParams contextParams)
         {
-            var asyncTask = Task.Factory.StartNew(() => InitFromBuffer(buffer, contextParams));
+            var asyncTask = Task.Run(() => InitFromBuffer(buffer, contextParams));
             return await asyncTask;
         }
 
